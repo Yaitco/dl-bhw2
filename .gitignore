@@ -1,0 +1,36 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Project artifacts
+checkpoint/
+predictions/
+storage/
+
+# Logs
+*.log
