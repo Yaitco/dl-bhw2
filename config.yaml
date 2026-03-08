@@ -5,31 +5,36 @@ comet_config:
   project_name: dl-bhw2
 random_seed: 42
 
+vocab:
+  min_count: 5
+
 train:
-  num_epochs: 8
-  beam_size: 4
+  num_epochs: 30
+  beam_size: 1
   max_new_tokens: 80
   max_grad_norm: 1.0
+  label_smoothing: 0.1
+  bleu_max_batches: 3
+  bleu_max_samples: null
 
 model:
   name: TRANSFORMER
   d_model: 512
   n_heads: 8
-  n_layers: 3
+  n_layers: 4
   d_ff: 2048
-  dropout: 0.1
-  max_src_len: 256
-  max_tgt_len: 256
+  dropout: 0.15
+  max_src_len: 100
+  max_tgt_len: 100
 
 optimizer:
   name: AdamW
-  lr: 0.001
-  weight_decay: 0.0
+  lr: 0.0003
+  weight_decay: 0.0001
 
 scheduler:
-  name: CosineAnnealingLR
-  eta_min: 0.00001
-  T_max: 8
+  name: transformer_warmup
+  warmup_steps: 2000
 
 train_dataset:
   source_path: bhw2-data/data/train.de-en.de
@@ -43,7 +48,7 @@ test_dataset:
   source_path: bhw2-data/data/test1.de-en.de
 
 train_loader:
-  batch_size: 32
+  batch_size: 64
   shuffle: true
   pin_memory: true
   num_workers: 2
@@ -68,3 +73,11 @@ inference:
   checkpoint_path: checkpoint/best_model.pt
   output_path: predictions/test1.translations.en
   max_len: 80
+  beam_size: 5
+
+checkpoint_averaging:
+  enabled: True
+  num_last: 5
+  dir: checkpoint/avg
+  metric: loss
+  reset_on_start: true

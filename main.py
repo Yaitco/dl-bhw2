@@ -1,5 +1,6 @@
 import random
 import warnings
+import json
 from functools import partial
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from dataset.dataset import TestDataset, TranslationDataset, Vocabulary
 from model.transformer import TransformerConfig, TransformerSeq2Seq
 from train import train
 from utils.config import build_optimizer, build_scheduler
+from utils.utils import average_checkpoints
 
 
 def test_collate_fn(batch, source_vocab):
@@ -64,6 +66,7 @@ def save_test_translations(
                 src_ids=src_ids[i].unsqueeze(0),
                 bos_id=target_vocab.bos_id,
                 eos_id=target_vocab.eos_id,
+                unk_id=target_vocab.unk_id,
                 max_new_tokens=max_new_tokens,
                 beam_size=beam_size,
             )
@@ -92,9 +95,10 @@ def main(config=None):
     beam_size = config["train"].get("beam_size", 4)
     max_new_tokens = config["train"].get("max_new_tokens", 80)
     max_grad_norm = config["train"].get("max_grad_norm", 1.0)
+    vocab_min_count = int(config.get("vocab", {}).get("min_count", 10))
 
-    source_vocab = Vocabulary(min_count=10)
-    target_vocab = Vocabulary(min_count=10)
+    source_vocab = Vocabulary(min_count=vocab_min_count)
+    target_vocab = Vocabulary(min_count=vocab_min_count)
 
     with open(config["train_dataset"]["source_path"], "r", encoding="utf-8") as f:
         source = [line.strip("\n") for line in f]
@@ -130,12 +134,24 @@ def main(config=None):
     model_name = str(model_cfg.get("name", "TRANSFORMER")).upper()
     if model_name not in {"TRANSFORMER", "TRANSFORMER_SEQ2SEQ"}:
         raise ValueError(f"Unknown model name: {model_name}")
+    max_src_len = int(model_cfg.get("max_src_len", 256))
+    max_tgt_len = int(model_cfg.get("max_tgt_len", 256))
+    train_src_max = max((len(line.split()) for line in source), default=0)
+    train_tgt_max_with_specials = max((len(line.split()) for line in target), default=0) + 2
+    required_tgt_len = max(train_tgt_max_with_specials, int(max_new_tokens) + 1)
+    if max_src_len < train_src_max or max_tgt_len < required_tgt_len:
+        raise ValueError(
+            f"model positional limits are too small: "
+            f"max_src_len={max_src_len} (required >= {train_src_max}), "
+            f"max_tgt_len={max_tgt_len} (required >= {required_tgt_len}). "
+            f"Increase model.max_src_len/model.max_tgt_len in config.yaml."
+        )
 
     transformer_cfg = TransformerConfig(
         src_vocab_size=len(source_vocab),
         tgt_vocab_size=len(target_vocab),
-        max_src_len=int(model_cfg.get("max_src_len", 256)),
-        max_tgt_len=int(model_cfg.get("max_tgt_len", 256)),
+        max_src_len=max_src_len,
+        max_tgt_len=max_tgt_len,
         pad_id=source_vocab.pad_id,
         d_model=int(model_cfg.get("d_model", 512)),
         n_heads=int(model_cfg.get("n_heads", 8)),
@@ -147,7 +163,11 @@ def main(config=None):
 
     optimizer = build_optimizer(config["optimizer"], model)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=target_vocab.pad_id)
-    scheduler = build_scheduler(config["scheduler"], optimizer)
+    scheduler_cfg = dict(config["scheduler"])
+    scheduler_name = str(scheduler_cfg.get("name", "")).lower().replace("-", "_")
+    if scheduler_name in {"transformer_warmup", "transformerwarmup", "noamlr"}:
+        scheduler_cfg.setdefault("d_model", transformer_cfg.d_model)
+    scheduler = build_scheduler(scheduler_cfg, optimizer)
 
     experiment = None
     if config.get("comet"):
@@ -159,28 +179,65 @@ def main(config=None):
 
     print(model)
     print(f"Number of params: {sum(p.numel() for p in model.parameters())}")
-    best_bleu = train(
-        config=config,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        criterion=criterion,
-        train_loader=train_loader,
-        test_loader=val_loader,
-        num_epochs=config["train"]["num_epochs"],
-        device=device,
-        pad_id=target_vocab.pad_id,
-        bos_id=target_vocab.bos_id,
-        eos_id=target_vocab.eos_id,
-        tgt_vocab=target_vocab,
-        experiment=experiment,
-        beam_size=beam_size,
-        max_new_tokens=max_new_tokens,
-        max_grad_norm=max_grad_norm,
-    )
+    best_bleu = None
+    try:
+        best_bleu = train(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            criterion=criterion,
+            train_loader=train_loader,
+            test_loader=val_loader,
+            num_epochs=config["train"]["num_epochs"],
+            device=device,
+            pad_id=target_vocab.pad_id,
+            bos_id=target_vocab.bos_id,
+            eos_id=target_vocab.eos_id,
+            tgt_vocab=target_vocab,
+            experiment=experiment,
+            beam_size=beam_size,
+            max_new_tokens=max_new_tokens,
+            max_grad_norm=max_grad_norm,
+        )
+    except KeyboardInterrupt:
+        print("Training interrupted. Running test inference from latest saved checkpoint (if available).")
 
-    ckpt = torch.load(config["save_path"], map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    save_path = Path(config["save_path"])
+    avg_cfg = config.get("checkpoint_averaging", {})
+    avg_enabled = bool(avg_cfg.get("enabled", False))
+    avg_dir = Path(avg_cfg.get("dir", "checkpoint/avg"))
+    avg_num_last = int(avg_cfg.get("num_last", 5))
+    avg_manifest_path = avg_dir / "manifest.json"
+    avg_paths = []
+
+    if avg_enabled:
+        if avg_manifest_path.exists():
+            payload = json.loads(avg_manifest_path.read_text(encoding="utf-8"))
+            avg_paths = [avg_dir / rec["path"] for rec in payload.get("checkpoints", [])]
+            avg_paths = [p for p in avg_paths if p.exists()][:avg_num_last]
+        if len(avg_paths) == 0:
+            avg_paths = sorted(avg_dir.glob("epoch_*.pt"), key=lambda p: p.stat().st_mtime)
+            avg_paths = avg_paths[-avg_num_last:]
+        if len(avg_paths) > 0:
+            print(f"Using checkpoint averaging from {len(avg_paths)} checkpoints.")
+            avg_state = average_checkpoints(avg_paths, map_location=device)
+            model.load_state_dict(avg_state)
+        elif save_path.exists():
+            ckpt = torch.load(save_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model"])
+        else:
+            print(f"Checkpoint not found at {save_path}. Skipping final test inference.")
+            avg_paths = None
+    elif save_path.exists():
+        ckpt = torch.load(save_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+    else:
+        print(f"Checkpoint not found at {save_path}. Skipping final test inference.")
+        return best_bleu
+
+    if (not avg_enabled and not save_path.exists()) or (avg_enabled and (not avg_paths) and not save_path.exists()):
+        return best_bleu
 
     save_test_translations(
         model=model,
@@ -193,6 +250,7 @@ def main(config=None):
         beam_size=config["inference"].get("beam_size", beam_size),
         max_new_tokens=config["inference"].get("max_len", max_new_tokens),
     )
+
 
     if experiment is not None:
         experiment.log_asset(config["test_output"]["path"])

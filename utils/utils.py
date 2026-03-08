@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import random
+from pathlib import Path
 from comet_ml import Experiment
 from sacrebleu.metrics import BLEU
 
@@ -56,3 +57,35 @@ def corpus_bleu_sacrebleu(hypotheses, references):
     bleu = BLEU(tokenize="none")
     result = bleu.corpus_score(hypotheses, [references])
     return result
+
+def average_checkpoints(checkpoint_paths, map_location="cpu"):
+    checkpoint_paths = [str(p) for p in checkpoint_paths]
+    if len(checkpoint_paths) == 0:
+        raise ValueError("No checkpoints provided for averaging.")
+
+    sum_state = {}
+    float_dtypes = {}
+
+    for idx, path in enumerate(checkpoint_paths):
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+        if idx == 0:
+            for key, value in state.items():
+                if torch.is_floating_point(value):
+                    sum_state[key] = value.detach().clone().to(torch.float32)
+                    float_dtypes[key] = value.dtype
+                else:
+                    sum_state[key] = value.detach().clone()
+            continue
+
+        for key, value in state.items():
+            if torch.is_floating_point(value):
+                sum_state[key] += value.detach().to(torch.float32)
+
+    count = float(len(checkpoint_paths))
+    for key in list(sum_state.keys()):
+        if key in float_dtypes:
+            sum_state[key] = (sum_state[key] / count).to(float_dtypes[key])
+
+    return sum_state

@@ -1,4 +1,5 @@
 import argparse
+import json
 from functools import partial
 from pathlib import Path
 
@@ -6,9 +7,11 @@ import torch
 import yaml
 from torch import nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from dataset.dataset import TestDataset, Vocabulary
 from model.transformer import TransformerConfig, TransformerSeq2Seq
+from utils.utils import average_checkpoints
 
 
 def test_collate_fn(batch, source_vocab):
@@ -33,8 +36,9 @@ def ids_to_text(ids, vocab: Vocabulary):
 
 
 def build_vocabs(config):
-    source_vocab = Vocabulary()
-    target_vocab = Vocabulary()
+    vocab_min_count = int(config.get("vocab", {}).get("min_count", 10))
+    source_vocab = Vocabulary(min_count=vocab_min_count)
+    target_vocab = Vocabulary(min_count=vocab_min_count)
 
     with open(config["train_dataset"]["source_path"], "r", encoding="utf-8") as f:
         source = [line.strip("\n") for line in f]
@@ -50,17 +54,30 @@ def build_vocabs(config):
 def run_inference(config, checkpoint_path=None, output_path=None):
     device = config["device"]
     source_vocab, target_vocab = build_vocabs(config)
+    max_new_tokens = int(config["inference"].get("max_len", config["test_output"].get("max_len", 80)))
 
     model_cfg = config.get("model", {})
     model_name = str(model_cfg.get("name", "TRANSFORMER")).upper()
     if model_name not in {"TRANSFORMER", "TRANSFORMER_SEQ2SEQ"}:
         raise ValueError(f"Unknown model name: {model_name}")
+    max_src_len = int(model_cfg.get("max_src_len", 256))
+    max_tgt_len = int(model_cfg.get("max_tgt_len", 256))
+    with open(config["test_dataset"]["source_path"], "r", encoding="utf-8") as f:
+        test_src_max = max((len(line.strip().split()) for line in f), default=0)
+    required_tgt_len = max_new_tokens + 1
+    if max_src_len < test_src_max or max_tgt_len < required_tgt_len:
+        raise ValueError(
+            f"model positional limits are too small for inference: "
+            f"max_src_len={max_src_len} (required >= {test_src_max}), "
+            f"max_tgt_len={max_tgt_len} (required >= {required_tgt_len}). "
+            f"Increase model.max_src_len/model.max_tgt_len in config.yaml."
+        )
 
     transformer_cfg = TransformerConfig(
         src_vocab_size=len(source_vocab),
         tgt_vocab_size=len(target_vocab),
-        max_src_len=int(model_cfg.get("max_src_len", 256)),
-        max_tgt_len=int(model_cfg.get("max_tgt_len", 256)),
+        max_src_len=max_src_len,
+        max_tgt_len=max_tgt_len,
         pad_id=source_vocab.pad_id,
         d_model=int(model_cfg.get("d_model", 512)),
         n_heads=int(model_cfg.get("n_heads", 8)),
@@ -70,9 +87,37 @@ def run_inference(config, checkpoint_path=None, output_path=None):
     )
     model = TransformerSeq2Seq(transformer_cfg).to(device)
 
-    ckpt_path = checkpoint_path or config["inference"]["checkpoint_path"]
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    avg_cfg = config.get("checkpoint_averaging", {})
+    avg_enabled = bool(avg_cfg.get("enabled", False))
+    avg_dir = Path(avg_cfg.get("dir", "checkpoint/avg"))
+    avg_num_last = int(avg_cfg.get("num_last", 5))
+    avg_manifest_path = avg_dir / "manifest.json"
+
+    if checkpoint_path is not None:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+    elif avg_enabled:
+        if avg_manifest_path.exists():
+            payload = json.loads(avg_manifest_path.read_text(encoding="utf-8"))
+            avg_paths = [avg_dir / rec["path"] for rec in payload.get("checkpoints", [])]
+            avg_paths = [p for p in avg_paths if p.exists()][:avg_num_last]
+        else:
+            avg_paths = []
+        if len(avg_paths) == 0:
+            avg_paths = sorted(avg_dir.glob("epoch_*.pt"), key=lambda p: p.stat().st_mtime)
+            avg_paths = avg_paths[-avg_num_last:]
+        if len(avg_paths) > 0:
+            print(f"Using checkpoint averaging from {len(avg_paths)} checkpoints.")
+            avg_state = average_checkpoints(avg_paths, map_location=device)
+            model.load_state_dict(avg_state)
+        else:
+            ckpt_path = config["inference"]["checkpoint_path"]
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model"])
+    else:
+        ckpt_path = config["inference"]["checkpoint_path"]
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
     model.eval()
 
     test_dataset = TestDataset(source_path=config["test_dataset"]["source_path"])
@@ -84,14 +129,14 @@ def run_inference(config, checkpoint_path=None, output_path=None):
 
     predictions = []
     beam_size = int(config["inference"].get("beam_size", 4))
-    max_new_tokens = int(config["inference"].get("max_len", config["test_output"].get("max_len", 80)))
-    for src_ids, _ in test_loader:
+    for src_ids, _ in tqdm(test_loader, desc="Inference"):
         src_ids = src_ids.to(device, non_blocking=True)
         for i in range(src_ids.size(0)):
             pred = model.beam_search_decode(
                 src_ids=src_ids[i].unsqueeze(0),
                 bos_id=target_vocab.bos_id,
                 eos_id=target_vocab.eos_id,
+                unk_id=target_vocab.unk_id,
                 max_new_tokens=max_new_tokens,
                 beam_size=beam_size,
             )

@@ -1,6 +1,8 @@
+import math
 from typing import Dict
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
 from model.transformer import TransformerConfig, TransformerSeq2Seq
 
 name_to_optimizer = {
@@ -26,10 +28,28 @@ name_to_scheduler = {
     'plateau': torch.optim.lr_scheduler.ReduceLROnPlateau,
 }
 
+def get_transformer_scheduler(optimizer, d_model, warmup_steps=4000):
+    base_lr = float(optimizer.param_groups[0]["lr"])
+    if base_lr <= 0:
+        raise ValueError("Optimizer lr must be > 0 for transformer_warmup scheduler.")
+
+    def lr_lambda(step):
+        step = max(step, 1)
+        target_lr = (d_model ** -0.5) * min(step ** -0.5, step * (warmup_steps ** -1.5))
+        return target_lr / base_lr
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
 def build_scheduler(config: Dict, optimizer):
     config = dict(config) 
     name = config["name"]
     config.pop('name')
+
+    normalized_name = str(name).lower().replace("-", "_")
+    if normalized_name in {"transformer_warmup", "transformerwarmup", "noamlr"}:
+        d_model = int(config.pop("d_model"))
+        warmup_steps = int(config.pop("warmup_steps", 4000))
+        return get_transformer_scheduler(optimizer, d_model=d_model, warmup_steps=warmup_steps)
 
     scheduler = name_to_scheduler[name]
 

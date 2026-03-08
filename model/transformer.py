@@ -8,12 +8,10 @@ import torch.nn.functional as F
 
 
 def make_padding_mask(ids: torch.Tensor, pad_id: int) -> torch.Tensor:
-    # [B, L] -> [B, 1, 1, L], True for padded positions
     return (ids == pad_id).unsqueeze(1).unsqueeze(1)
 
 
 def make_causal_mask(t: int, device: torch.device) -> torch.Tensor:
-    # [1, 1, T, T], True for masked future positions
     return torch.triu(torch.ones(t, t, dtype=torch.bool, device=device), diagonal=1).unsqueeze(0).unsqueeze(0)
 
 
@@ -50,10 +48,18 @@ class MultiHeadAttention(nn.Module):
         v: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
+        past_k: torch.Tensor | None = None,
+        past_v: torch.Tensor | None = None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
         q = self._split_heads(self.wq(q))
         k = self._split_heads(self.wk(k))
         v = self._split_heads(self.wv(v))
+
+        if past_k is not None:
+            k = torch.cat([past_k, k], dim=2)
+        if past_v is not None:
+            v = torch.cat([past_v, v], dim=2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
 
@@ -70,6 +76,8 @@ class MultiHeadAttention(nn.Module):
 
         out = self.wo(ctx)
         out = self.out_drop(out)
+        if use_cache:
+            return out, k, v
         return out
 
 
@@ -123,14 +131,32 @@ class DecoderBlock(nn.Module):
         tgt_attn_mask: torch.Tensor | None = None,
         tgt_key_padding_mask: torch.Tensor | None = None,
         src_key_padding_mask: torch.Tensor | None = None,
+        layer_past: dict | None = None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
-        x = x + self.sa(
-            self.ln1(x),
-            self.ln1(x),
-            self.ln1(x),
-            attn_mask=tgt_attn_mask,
-            key_padding_mask=tgt_key_padding_mask,
-        )
+        past_self_k = None if layer_past is None else layer_past.get("sk")
+        past_self_v = None if layer_past is None else layer_past.get("sv")
+
+        y = self.ln1(x)
+        if use_cache:
+            sa_out, present_sk, present_sv = self.sa(
+                y, y, y,
+                attn_mask=tgt_attn_mask,
+                key_padding_mask=tgt_key_padding_mask,
+                past_k=past_self_k,
+                past_v=past_self_v,
+                use_cache=True,
+            )
+        else:
+            sa_out = self.sa(
+                self.ln1(x),
+                self.ln1(x),
+                self.ln1(x),
+                attn_mask=tgt_attn_mask,
+                key_padding_mask=tgt_key_padding_mask,
+            )
+
+        x = x + sa_out
 
         x = x + self.ca(
             self.ln2(x),
@@ -140,6 +166,13 @@ class DecoderBlock(nn.Module):
         )
 
         x = x + self.ff(self.ln3(x))
+        
+        if use_cache:
+            present = {
+                "sk": present_sk,
+                "sv": present_sv,
+            }
+            return x, present
         return x
 
 
@@ -168,15 +201,32 @@ class Decoder(nn.Module):
         tgt_attn_mask: torch.Tensor | None = None,
         tgt_key_padding_mask: torch.Tensor | None = None,
         src_key_padding_mask: torch.Tensor | None = None,
+        past_key_values: list[dict] | None = None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(
-                x,
-                memory,
-                tgt_attn_mask=tgt_attn_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                src_key_padding_mask=src_key_padding_mask,
-            )
+        
+        presents = [] if use_cache else None
+        for i, layer in enumerate(self.layers):
+            layer_past = None if past_key_values is None else past_key_values[i]
+
+            if use_cache:
+                x, present = layer(
+                    x, memory,
+                    tgt_attn_mask=tgt_attn_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    layer_past=layer_past,
+                    use_cache=True,
+                )
+                presents.append(present)
+            else:
+                x = layer(
+                    x,
+                    memory,
+                    tgt_attn_mask=tgt_attn_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                )
         return self.ln_f(x)
 
 
@@ -258,6 +308,7 @@ class TransformerSeq2Seq(nn.Module):
         src_ids: torch.Tensor,
         bos_id: int,
         eos_id: int,
+        unk_id: int,
         max_new_tokens: int,
         beam_size: int = 4,
         length_penalty: float = 0.6,
@@ -287,7 +338,9 @@ class TransformerSeq2Seq(nn.Module):
                     continue
 
                 logits = self.decode(beam["tokens"], memory, src_key_padding_mask)
-                log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
+                next_token_logits = logits[:, -1, :]
+                # next_token_logits[:, unk_id] = -1e9
+                log_probs = F.log_softmax(next_token_logits, dim=-1)
                 topk_log_probs, topk_ids = torch.topk(log_probs, beam_size, dim=-1)
 
                 for j in range(beam_size):

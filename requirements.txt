@@ -1,1 +1,6 @@
-comet_ml
+torch>=2.2
+numpy>=1.24
+PyYAML>=6.0
+sacrebleu>=2.4
+tqdm>=4.66
+comet-ml>=3.45
