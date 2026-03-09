@@ -9,19 +9,24 @@ vocab:
   min_count: 5
 
 train:
-  num_epochs: 30
+  num_epochs: 20
+  mode: dual
   beam_size: 1
   max_new_tokens: 80
   max_grad_norm: 1.0
-  label_smoothing: 0.1
-  bleu_max_batches: 3
+  label_smoothing: 0.05
+  bleu_max_batches: 7
   bleu_max_samples: null
+  dual:
+    reverse_prob_scheduler:
+      name: cosine
+      k: 0.1
 
 model:
   name: TRANSFORMER
   d_model: 512
   n_heads: 8
-  n_layers: 4
+  n_layers: 6
   d_ff: 2048
   dropout: 0.15
   max_src_len: 100
@@ -29,7 +34,7 @@ model:
 
 optimizer:
   name: AdamW
-  lr: 0.0003
+  lr: 0.00015
   weight_decay: 0.0001
 
 scheduler:
@@ -48,7 +53,13 @@ test_dataset:
   source_path: bhw2-data/data/test1.de-en.de
 
 train_loader:
-  batch_size: 64
+  batch_size: 32
+  shuffle: true
+  pin_memory: true
+  num_workers: 2
+
+reverse_train_loader:
+  batch_size: 32
   shuffle: true
   pin_memory: true
   num_workers: 2
@@ -72,8 +83,9 @@ test_output:
 inference:
   checkpoint_path: checkpoint/best_model.pt
   output_path: predictions/test1.translations.en
-  max_len: 80
+  max_len: 90
   beam_size: 5
+  replace_unk_with_attn_copy: True
 
 checkpoint_averaging:
   enabled: True

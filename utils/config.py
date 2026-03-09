@@ -32,11 +32,19 @@ def get_transformer_scheduler(optimizer, d_model, warmup_steps=4000):
     base_lr = float(optimizer.param_groups[0]["lr"])
     if base_lr <= 0:
         raise ValueError("Optimizer lr must be > 0 for transformer_warmup scheduler.")
+    warmup_steps = int(warmup_steps)
+    if warmup_steps <= 0:
+        raise ValueError("warmup_steps must be > 0 for transformer_warmup scheduler.")
 
     def lr_lambda(step):
         step = max(step, 1)
-        target_lr = (d_model ** -0.5) * min(step ** -0.5, step * (warmup_steps ** -1.5))
-        return target_lr / base_lr
+        # Normalized Noam schedule:
+        # - linear warmup up to 1.0 at `warmup_steps`
+        # - inverse-sqrt decay afterwards
+        # Effective lr is scaled by optimizer's current lr (base_lr).
+        warmup_ratio = step / warmup_steps
+        decay_ratio = (warmup_steps / step) ** 0.5
+        return min(warmup_ratio, decay_ratio)
 
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 

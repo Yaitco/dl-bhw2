@@ -51,6 +51,7 @@ class MultiHeadAttention(nn.Module):
         past_k: torch.Tensor | None = None,
         past_v: torch.Tensor | None = None,
         use_cache: bool = False,
+        return_attn: bool = False,
     ) -> torch.Tensor:
         q = self._split_heads(self.wq(q))
         k = self._split_heads(self.wk(k))
@@ -76,8 +77,12 @@ class MultiHeadAttention(nn.Module):
 
         out = self.wo(ctx)
         out = self.out_drop(out)
+        if use_cache and return_attn:
+            return out, k, v, attn
         if use_cache:
             return out, k, v
+        if return_attn:
+            return out, attn
         return out
 
 
@@ -133,6 +138,7 @@ class DecoderBlock(nn.Module):
         src_key_padding_mask: torch.Tensor | None = None,
         layer_past: dict | None = None,
         use_cache: bool = False,
+        return_cross_attn: bool = False,
     ) -> torch.Tensor:
         past_self_k = None if layer_past is None else layer_past.get("sk")
         past_self_v = None if layer_past is None else layer_past.get("sv")
@@ -158,12 +164,22 @@ class DecoderBlock(nn.Module):
 
         x = x + sa_out
 
-        x = x + self.ca(
-            self.ln2(x),
-            mem,
-            mem,
-            key_padding_mask=src_key_padding_mask,
-        )
+        if return_cross_attn:
+            ca_out, ca_attn = self.ca(
+                self.ln2(x),
+                mem,
+                mem,
+                key_padding_mask=src_key_padding_mask,
+                return_attn=True,
+            )
+        else:
+            ca_out = self.ca(
+                self.ln2(x),
+                mem,
+                mem,
+                key_padding_mask=src_key_padding_mask,
+            )
+        x = x + ca_out
 
         x = x + self.ff(self.ln3(x))
         
@@ -172,7 +188,11 @@ class DecoderBlock(nn.Module):
                 "sk": present_sk,
                 "sv": present_sv,
             }
+            if return_cross_attn:
+                return x, present, ca_attn
             return x, present
+        if return_cross_attn:
+            return x, ca_attn
         return x
 
 
@@ -203,31 +223,59 @@ class Decoder(nn.Module):
         src_key_padding_mask: torch.Tensor | None = None,
         past_key_values: list[dict] | None = None,
         use_cache: bool = False,
+        return_cross_attn: bool = False,
     ) -> torch.Tensor:
         
         presents = [] if use_cache else None
+        cross_attn_weights = [] if return_cross_attn else None
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
 
             if use_cache:
-                x, present = layer(
-                    x, memory,
-                    tgt_attn_mask=tgt_attn_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    src_key_padding_mask=src_key_padding_mask,
-                    layer_past=layer_past,
-                    use_cache=True,
-                )
+                if return_cross_attn:
+                    x, present, cross_attn = layer(
+                        x, memory,
+                        tgt_attn_mask=tgt_attn_mask,
+                        tgt_key_padding_mask=tgt_key_padding_mask,
+                        src_key_padding_mask=src_key_padding_mask,
+                        layer_past=layer_past,
+                        use_cache=True,
+                        return_cross_attn=True,
+                    )
+                    cross_attn_weights.append(cross_attn)
+                else:
+                    x, present = layer(
+                        x, memory,
+                        tgt_attn_mask=tgt_attn_mask,
+                        tgt_key_padding_mask=tgt_key_padding_mask,
+                        src_key_padding_mask=src_key_padding_mask,
+                        layer_past=layer_past,
+                        use_cache=True,
+                    )
                 presents.append(present)
             else:
-                x = layer(
-                    x,
-                    memory,
-                    tgt_attn_mask=tgt_attn_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    src_key_padding_mask=src_key_padding_mask,
-                )
-        return self.ln_f(x)
+                if return_cross_attn:
+                    x, cross_attn = layer(
+                        x,
+                        memory,
+                        tgt_attn_mask=tgt_attn_mask,
+                        tgt_key_padding_mask=tgt_key_padding_mask,
+                        src_key_padding_mask=src_key_padding_mask,
+                        return_cross_attn=True,
+                    )
+                    cross_attn_weights.append(cross_attn)
+                else:
+                    x = layer(
+                        x,
+                        memory,
+                        tgt_attn_mask=tgt_attn_mask,
+                        tgt_key_padding_mask=tgt_key_padding_mask,
+                        src_key_padding_mask=src_key_padding_mask,
+                    )
+        x = self.ln_f(x)
+        if return_cross_attn:
+            return x, cross_attn_weights
+        return x
 
 
 class LearnedPositionalEmbedding(nn.Module):
@@ -260,48 +308,86 @@ class TransformerSeq2Seq(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.src_tok_emb = nn.Embedding(cfg.src_vocab_size, cfg.d_model)
-        self.tgt_tok_emb = nn.Embedding(cfg.tgt_vocab_size, cfg.d_model)
+        self.src_tok_emb = nn.Embedding(cfg.src_vocab_size, cfg.d_model)  # de
+        self.tgt_tok_emb = nn.Embedding(cfg.tgt_vocab_size, cfg.d_model)  # en
 
-        self.src_pos_emb = LearnedPositionalEmbedding(cfg.max_src_len, cfg.d_model)
-        self.tgt_pos_emb = LearnedPositionalEmbedding(cfg.max_tgt_len, cfg.d_model)
+        self.enc_pos_emb = LearnedPositionalEmbedding(cfg.max_src_len, cfg.d_model)
+        self.dec_pos_emb = LearnedPositionalEmbedding(cfg.max_tgt_len, cfg.d_model)
+
         self.drop = nn.Dropout(cfg.dropout)
 
         self.encoder = Encoder(cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
         self.decoder = Decoder(cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
-        self.lm_head = nn.Linear(cfg.d_model, cfg.tgt_vocab_size, bias=False)
 
-    def encode(self, src_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.lm_head = nn.Linear(cfg.d_model, cfg.tgt_vocab_size, bias=False)          # en
+        self.lm_head_reverse = nn.Linear(cfg.d_model, cfg.src_vocab_size, bias=False)  # de
+
+    def encode(self, src_ids: torch.Tensor, direction: str):
         src_key_padding_mask = make_padding_mask(src_ids, self.cfg.pad_id)
 
-        x = self.src_tok_emb(src_ids) + self.src_pos_emb(src_ids)
+        if direction == "straight":   # de -> en
+            x = self.src_tok_emb(src_ids)
+        elif direction == "reverse":  # en -> de
+            x = self.tgt_tok_emb(src_ids)
+        else:
+            raise ValueError(direction)
+
+        x = x + self.enc_pos_emb(src_ids)
         x = self.drop(x)
 
         memory = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
         return memory, src_key_padding_mask
 
-    def decode(self, tgt_ids: torch.Tensor, memory: torch.Tensor, src_key_padding_mask: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        tgt_ids: torch.Tensor,
+        memory: torch.Tensor,
+        src_key_padding_mask: torch.Tensor,
+        direction: str,
+        return_cross_attn: bool = False,
+    ):
         tgt_key_padding_mask = make_padding_mask(tgt_ids, self.cfg.pad_id)
         tgt_attn_mask = make_causal_mask(tgt_ids.size(1), device=tgt_ids.device)
 
-        y = self.tgt_tok_emb(tgt_ids) + self.tgt_pos_emb(tgt_ids)
+        if direction == "straight":   # de -> en
+            y = self.tgt_tok_emb(tgt_ids)
+            head = self.lm_head
+        elif direction == "reverse":  # en -> de
+            y = self.src_tok_emb(tgt_ids)
+            head = self.lm_head_reverse
+        else:
+            raise ValueError(direction)
+
+        y = y + self.dec_pos_emb(tgt_ids)
         y = self.drop(y)
 
-        dec = self.decoder(
-            y,
-            memory,
-            tgt_attn_mask=tgt_attn_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            src_key_padding_mask=src_key_padding_mask,
-        )
-        logits = self.lm_head(dec)
+        if return_cross_attn:
+            dec, cross_attn_weights = self.decoder(
+                y,
+                memory,
+                tgt_attn_mask=tgt_attn_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                src_key_padding_mask=src_key_padding_mask,
+                return_cross_attn=True,
+            )
+        else:
+            dec = self.decoder(
+                y,
+                memory,
+                tgt_attn_mask=tgt_attn_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                src_key_padding_mask=src_key_padding_mask,
+            )
+        logits = head(dec)
+        if return_cross_attn:
+            return logits, cross_attn_weights
         return logits
 
-    def forward(self, src_ids: torch.Tensor, tgt_inp_ids: torch.Tensor) -> torch.Tensor:
-        memory, src_key_padding_mask = self.encode(src_ids)
-        logits = self.decode(tgt_inp_ids, memory, src_key_padding_mask)
+    def forward(self, src_ids: torch.Tensor, tgt_inp_ids: torch.Tensor, direction: str = "straight"):
+        memory, src_key_padding_mask = self.encode(src_ids, direction)
+        logits = self.decode(tgt_inp_ids, memory, src_key_padding_mask, direction)
         return logits
-
+    
     @torch.no_grad()
     def beam_search_decode(
         self,
@@ -312,7 +398,10 @@ class TransformerSeq2Seq(nn.Module):
         max_new_tokens: int,
         beam_size: int = 4,
         length_penalty: float = 0.6,
-    ) -> torch.Tensor:
+        direction: str = "straight",
+        replace_unk_with_attn_src: bool = False,
+        return_copy_positions: bool = False,
+    ):
         self.eval()
 
         def normalized_score(candidate: dict) -> float:
@@ -321,10 +410,15 @@ class TransformerSeq2Seq(nn.Module):
                 return candidate["score"]
             return candidate["score"] / (length ** length_penalty)
 
-        memory, src_key_padding_mask = self.encode(src_ids)
+        memory, src_key_padding_mask = self.encode(src_ids, direction=direction)
 
         beams = [
-            {"tokens": torch.tensor([[bos_id]], dtype=torch.long, device=src_ids.device), "score": 0.0, "finished": False}
+            {
+                "tokens": torch.tensor([[bos_id]], dtype=torch.long, device=src_ids.device),
+                "score": 0.0,
+                "finished": False,
+                "copy_src_positions": [None],
+            }
         ]
 
         for _ in range(max_new_tokens):
@@ -337,7 +431,25 @@ class TransformerSeq2Seq(nn.Module):
                     all_candidates.append(beam)
                     continue
 
-                logits = self.decode(beam["tokens"], memory, src_key_padding_mask)
+                if replace_unk_with_attn_src:
+                    logits, cross_attn_weights = self.decode(
+                        beam["tokens"],
+                        memory,
+                        src_key_padding_mask,
+                        direction=direction,
+                        return_cross_attn=True,
+                    )
+                    last_layer_attn = cross_attn_weights[-1][0, :, -1, :].mean(dim=0)
+                    if src_key_padding_mask is not None:
+                        src_pad_mask = src_key_padding_mask[0, 0, 0]
+                        last_layer_attn = last_layer_attn.masked_fill(src_pad_mask, float("-inf"))
+                    if torch.all(torch.isneginf(last_layer_attn)):
+                        best_src_pos = None
+                    else:
+                        best_src_pos = int(last_layer_attn.argmax().item())
+                else:
+                    logits = self.decode(beam["tokens"], memory, src_key_padding_mask, direction=direction)
+                    best_src_pos = None
                 next_token_logits = logits[:, -1, :]
                 # next_token_logits[:, unk_id] = -1e9
                 log_probs = F.log_softmax(next_token_logits, dim=-1)
@@ -345,10 +457,13 @@ class TransformerSeq2Seq(nn.Module):
 
                 for j in range(beam_size):
                     next_id = topk_ids[0, j].view(1, 1)
+                    next_id_value = int(next_id.item())
+                    copy_src_pos = best_src_pos if (replace_unk_with_attn_src and next_id_value == int(unk_id)) else None
                     candidate = {
                         "tokens": torch.cat([beam["tokens"], next_id], dim=1),
                         "score": beam["score"] + topk_log_probs[0, j].item(),
-                        "finished": next_id.item() == eos_id,
+                        "finished": next_id_value == eos_id,
+                        "copy_src_positions": beam["copy_src_positions"] + [copy_src_pos],
                     }
                     all_candidates.append(candidate)
 
@@ -356,6 +471,8 @@ class TransformerSeq2Seq(nn.Module):
             beams = all_candidates[:beam_size]
 
         best_beam = max(beams, key=normalized_score)
+        if return_copy_positions:
+            return best_beam["tokens"], best_beam["copy_src_positions"]
         return best_beam["tokens"]
 
 

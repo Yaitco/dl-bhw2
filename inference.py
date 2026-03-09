@@ -21,13 +21,35 @@ def test_collate_fn(batch, source_vocab):
     return src_padded, src_lens
 
 
-def ids_to_text(ids, vocab: Vocabulary):
+def build_unk_replacements(copy_src_positions, src_token_ids, source_vocab: Vocabulary):
+    if copy_src_positions is None:
+        return None
+    src_words = source_vocab.decode(src_token_ids.tolist())
+    replacements = []
+    for src_pos in copy_src_positions:
+        if src_pos is None or src_pos < 0 or src_pos >= len(src_words):
+            replacements.append(None)
+            continue
+        token = src_words[src_pos]
+        if token in {"<pad>", "<bos>", "<eos>"}:
+            replacements.append(None)
+        else:
+            replacements.append(token)
+    return replacements
+
+
+def ids_to_text(ids, vocab: Vocabulary, unk_replacements=None):
     result = []
-    for token_id in ids:
+    for idx, token_id in enumerate(ids):
         if token_id == vocab.eos_id:
             break
         if token_id in (vocab.pad_id, vocab.bos_id):
             continue
+        if token_id == vocab.unk_id and unk_replacements is not None and idx < len(unk_replacements):
+            replacement = unk_replacements[idx]
+            if replacement is not None:
+                result.append(replacement)
+                continue
         if 0 <= token_id < len(vocab.idx_to_word):
             result.append(vocab.idx_to_word[token_id])
         else:
@@ -129,18 +151,27 @@ def run_inference(config, checkpoint_path=None, output_path=None):
 
     predictions = []
     beam_size = int(config["inference"].get("beam_size", 4))
+    replace_unk_with_attn_copy = bool(config["inference"].get("replace_unk_with_attn_copy", False))
     for src_ids, _ in tqdm(test_loader, desc="Inference"):
         src_ids = src_ids.to(device, non_blocking=True)
         for i in range(src_ids.size(0)):
-            pred = model.beam_search_decode(
+            decode_out = model.beam_search_decode(
                 src_ids=src_ids[i].unsqueeze(0),
                 bos_id=target_vocab.bos_id,
                 eos_id=target_vocab.eos_id,
                 unk_id=target_vocab.unk_id,
                 max_new_tokens=max_new_tokens,
                 beam_size=beam_size,
+                replace_unk_with_attn_src=replace_unk_with_attn_copy,
+                return_copy_positions=replace_unk_with_attn_copy,
             )
-            predictions.append(ids_to_text(pred[0].tolist(), target_vocab))
+            if replace_unk_with_attn_copy:
+                pred, copy_src_positions = decode_out
+                unk_replacements = build_unk_replacements(copy_src_positions, src_ids[i], source_vocab)
+            else:
+                pred = decode_out
+                unk_replacements = None
+            predictions.append(ids_to_text(pred[0].tolist(), target_vocab, unk_replacements=unk_replacements))
 
     out_path = output_path or config["inference"]["output_path"]
     out_file = Path(out_path)

@@ -25,13 +25,35 @@ def test_collate_fn(batch, source_vocab):
     return src_padded, src_lens
 
 
-def ids_to_text(ids, vocab: Vocabulary):
+def build_unk_replacements(copy_src_positions, src_token_ids, source_vocab: Vocabulary):
+    if copy_src_positions is None:
+        return None
+    src_words = source_vocab.decode(src_token_ids.tolist())
+    replacements = []
+    for src_pos in copy_src_positions:
+        if src_pos is None or src_pos < 0 or src_pos >= len(src_words):
+            replacements.append(None)
+            continue
+        token = src_words[src_pos]
+        if token in {"<pad>", "<bos>", "<eos>"}:
+            replacements.append(None)
+        else:
+            replacements.append(token)
+    return replacements
+
+
+def ids_to_text(ids, vocab: Vocabulary, unk_replacements=None):
     result = []
-    for token_id in ids:
+    for idx, token_id in enumerate(ids):
         if token_id == vocab.eos_id:
             break
         if token_id in (vocab.pad_id, vocab.bos_id):
             continue
+        if token_id == vocab.unk_id and unk_replacements is not None and idx < len(unk_replacements):
+            replacement = unk_replacements[idx]
+            if replacement is not None:
+                result.append(replacement)
+                continue
         if 0 <= token_id < len(vocab.idx_to_word):
             result.append(vocab.idx_to_word[token_id])
         else:
@@ -50,6 +72,7 @@ def save_test_translations(
     test_loader_cfg,
     beam_size=4,
     max_new_tokens=80,
+    replace_unk_with_attn_copy: bool = False,
 ):
     model.eval()
 
@@ -62,15 +85,23 @@ def save_test_translations(
         src_ids = src_ids.to(device, non_blocking=True)
 
         for i in range(src_ids.size(0)):
-            generated = model.beam_search_decode(
+            decode_out = model.beam_search_decode(
                 src_ids=src_ids[i].unsqueeze(0),
                 bos_id=target_vocab.bos_id,
                 eos_id=target_vocab.eos_id,
                 unk_id=target_vocab.unk_id,
                 max_new_tokens=max_new_tokens,
                 beam_size=beam_size,
+                replace_unk_with_attn_src=replace_unk_with_attn_copy,
+                return_copy_positions=replace_unk_with_attn_copy,
             )
-            predictions.append(ids_to_text(generated[0].tolist(), target_vocab))
+            if replace_unk_with_attn_copy:
+                generated, copy_src_positions = decode_out
+                unk_replacements = build_unk_replacements(copy_src_positions, src_ids[i], source_vocab)
+            else:
+                generated = decode_out
+                unk_replacements = None
+            predictions.append(ids_to_text(generated[0].tolist(), target_vocab, unk_replacements=unk_replacements))
 
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +126,14 @@ def main(config=None):
     beam_size = config["train"].get("beam_size", 4)
     max_new_tokens = config["train"].get("max_new_tokens", 80)
     max_grad_norm = config["train"].get("max_grad_norm", 1.0)
+    train_mode = str(config.get("train", {}).get("mode", "direct")).lower().replace("-", "_")
+    if train_mode in {"single", "forward", "straight"}:
+        train_mode = "direct"
+    if train_mode in {"double", "mixed", "bidirectional"}:
+        train_mode = "dual"
+    if train_mode not in {"direct", "dual"}:
+        raise ValueError(f"train.mode must be 'direct' or 'dual'. Got: {config.get('train', {}).get('mode')}")
+    needs_reverse_loader = train_mode == "dual"
     vocab_min_count = int(config.get("vocab", {}).get("min_count", 10))
 
     source_vocab = Vocabulary(min_count=vocab_min_count)
@@ -129,6 +168,22 @@ def main(config=None):
     )
     train_loader = DataLoader(train_dataset, collate_fn=collate, **config["train_loader"])
     val_loader = DataLoader(val_dataset, collate_fn=collate, **config["val_loader"])
+    reverse_train_loader = None
+    if needs_reverse_loader:
+        reverse_train_dataset = TranslationDataset(
+            source_path=config["train_dataset"]["target_path"],
+            target_path=config["train_dataset"]["source_path"],
+            source_vocab=target_vocab,
+            target_vocab=source_vocab,
+        )
+        reverse_collate = partial(
+            collate_fn,
+            pad_id=target_vocab.pad_id,
+            bos_id=source_vocab.bos_id,
+            eos_id=source_vocab.eos_id,
+        )
+        reverse_loader_cfg = config.get("reverse_train_loader", config["train_loader"])
+        reverse_train_loader = DataLoader(reverse_train_dataset, collate_fn=reverse_collate, **reverse_loader_cfg)
 
     model_cfg = config.get("model", {})
     model_name = str(model_cfg.get("name", "TRANSFORMER")).upper()
@@ -136,13 +191,15 @@ def main(config=None):
         raise ValueError(f"Unknown model name: {model_name}")
     max_src_len = int(model_cfg.get("max_src_len", 256))
     max_tgt_len = int(model_cfg.get("max_tgt_len", 256))
-    train_src_max = max((len(line.split()) for line in source), default=0)
-    train_tgt_max_with_specials = max((len(line.split()) for line in target), default=0) + 2
+    train_de_max = max((len(line.split()) for line in source), default=0)
+    train_en_max = max((len(line.split()) for line in target), default=0)
+    train_tgt_max_with_specials = max(train_de_max, train_en_max) + 2
+    required_src_len = max(train_de_max, train_en_max)
     required_tgt_len = max(train_tgt_max_with_specials, int(max_new_tokens) + 1)
-    if max_src_len < train_src_max or max_tgt_len < required_tgt_len:
+    if max_src_len < required_src_len or max_tgt_len < required_tgt_len:
         raise ValueError(
             f"model positional limits are too small: "
-            f"max_src_len={max_src_len} (required >= {train_src_max}), "
+            f"max_src_len={max_src_len} (required >= {required_src_len}), "
             f"max_tgt_len={max_tgt_len} (required >= {required_tgt_len}). "
             f"Increase model.max_src_len/model.max_tgt_len in config.yaml."
         )
@@ -163,11 +220,15 @@ def main(config=None):
 
     optimizer = build_optimizer(config["optimizer"], model)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=target_vocab.pad_id)
-    scheduler_cfg = dict(config["scheduler"])
-    scheduler_name = str(scheduler_cfg.get("name", "")).lower().replace("-", "_")
-    if scheduler_name in {"transformer_warmup", "transformerwarmup", "noamlr"}:
-        scheduler_cfg.setdefault("d_model", transformer_cfg.d_model)
-    scheduler = build_scheduler(scheduler_cfg, optimizer)
+    scheduler = None
+    scheduler_cfg_raw = config.get("scheduler")
+    if scheduler_cfg_raw is not None:
+        scheduler_cfg = dict(scheduler_cfg_raw)
+        scheduler_name = str(scheduler_cfg.get("name", "")).lower().replace("-", "_")
+        if scheduler_name not in {"", "none", "null", "off", "disabled"}:
+            if scheduler_name in {"transformer_warmup", "transformerwarmup", "noamlr"}:
+                scheduler_cfg.setdefault("d_model", transformer_cfg.d_model)
+            scheduler = build_scheduler(scheduler_cfg, optimizer)
 
     experiment = None
     if config.get("comet"):
@@ -188,6 +249,7 @@ def main(config=None):
             scheduler=scheduler,
             criterion=criterion,
             train_loader=train_loader,
+            reverse_train_loader=reverse_train_loader,
             test_loader=val_loader,
             num_epochs=config["train"]["num_epochs"],
             device=device,
@@ -249,6 +311,7 @@ def main(config=None):
         test_loader_cfg=config["test_loader"],
         beam_size=config["inference"].get("beam_size", beam_size),
         max_new_tokens=config["inference"].get("max_len", max_new_tokens),
+        replace_unk_with_attn_copy=bool(config["inference"].get("replace_unk_with_attn_copy", False)),
     )
 
 
